@@ -76,6 +76,10 @@ def parse_args():
     parser.add_argument("--force_think_prefix", action="store_true",
                         help="Append '<think>\\n' to prompt for thinking models")
 
+    parser.add_argument("--generation_batch_size", type=int, default=1,
+                        help="Number of examples to generate in parallel during Pass 1 "
+                             "(Pass 2 hidden-state extraction is always per-example). "
+                             "Increase to amortise generation overhead across examples.")
     parser.add_argument("--save_float16", action="store_true",
                         help="Save hidden states as float16 (halves disk usage)")
     parser.add_argument("--save_every", type=int, default=10,
@@ -377,67 +381,43 @@ def compute_tts_scores(
 
 
 # -------------------------
-# Two-pass generation + hidden state extraction
+# Pass 1 — batched generation
 # -------------------------
 
 @torch.no_grad()
-def generate_twopass_with_hidden_states(
+def batch_generate_pass1(
     model,
     tokenizer,
-    prompt_text: str,
-    layers: List[int],
-    step_token_seq: List[int],
-    hash_token_seq: List[int],
-    close_think_seq: List[int],
+    prompt_texts: List[str],
     max_input_length: int,
     max_new_tokens: int,
     temperature: float = 0.0,
     do_sample: bool = False,
     top_p: float = 1.0,
-    thinking_model: bool = False,
-) -> Tuple[str, List[int], List[Dict[str, Any]], Dict[int, Dict[str, List[torch.Tensor]]]]:
+) -> List[List[int]]:
+    """Generate completions for a batch of prompts (no hidden state capture).
+
+    Uses left-padding so all prompts in the batch share the same input length.
+    After generation the generated tokens for every example start at the same
+    offset (padded_length), making extraction straightforward.
+
+    Returns a list of generated token ID lists, one per prompt.
+    Trailing pad / post-EOS tokens are stripped from each sequence.
     """
-    Two-pass generation with two hidden-state extraction approaches.
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
 
-    Pass 1 — fast generation:
-        model.generate() produces the full token sequence without capturing activations.
-
-    Pass 2 — single forward pass:
-        One forward pass over the complete (prompt + generated) sequence with
-        output_hidden_states=True, from which both approaches are computed:
-
-        "marker" — h^(l)_{t(Step k) - 1}:
-            The hidden state at (full_pos - 1), i.e. the token immediately preceding
-            the anchor.  This is the representation that predicted the anchor token,
-            exactly as in the reasoning-trajectory repo.
-
-        "mean" — mean over the step span:
-            The mean of hidden states across all token positions in the step span
-            [rel_pos, next_rel_pos), i.e. all tokens belonging to this step.
-
-        Both are extracted from the same forward pass at no extra cost.
-
-    Anchors detected (in the generated portion only):
-        - "Step" token sequence → type "step", section "thinking" or "response"
-        - "####" token sequence → type "answer", section "response"
-
-    Returns:
-        generated_text        : decoded generated text
-        generated_ids         : list[int] of generated token IDs
-        anchor_steps          : list of dicts, one per anchor, in position order
-        per_layer_step_hiddens: {layer: {"marker": [...], "mean": [...]}} aligned with anchor_steps
-    """
     inputs = tokenizer(
-        prompt_text,
+        prompt_texts,
         return_tensors="pt",
         truncation=True,
         max_length=max_input_length,
+        padding=True,
     )
     input_ids = inputs["input_ids"].to(model.device)
     attention_mask = inputs["attention_mask"].to(model.device)
-    prompt_length = input_ids.shape[1]
+    padded_length = input_ids.shape[1]
 
-    # --- Pass 1: fast generation (no hidden state capture) ---
     gen_kwargs: Dict[str, Any] = dict(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -449,14 +429,77 @@ def generate_twopass_with_hidden_states(
     else:
         gen_kwargs["do_sample"] = False
 
-    full_ids = model.generate(**gen_kwargs)          # [1, prompt_len + gen_len]
-    generated_ids: List[int] = full_ids[0, prompt_length:].tolist()
+    full_ids = model.generate(**gen_kwargs)  # [B, padded_length + max_new_tokens]
+    tokenizer.padding_side = original_padding_side
 
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+    eos_id = tokenizer.eos_token_id
+
+    all_generated_ids: List[List[int]] = []
+    for i in range(len(prompt_texts)):
+        gen = full_ids[i, padded_length:].tolist()
+        # Keep up to and including the first EOS, drop the rest (padding)
+        if eos_id is not None and eos_id in gen:
+            gen = gen[: gen.index(eos_id) + 1]
+        elif pad_id is not None:
+            while gen and gen[-1] == pad_id:
+                gen.pop()
+        all_generated_ids.append(gen)
+
+    return all_generated_ids
+
+
+# -------------------------
+# Pass 2 — per-example hidden state extraction
+# -------------------------
+
+@torch.no_grad()
+def extract_hidden_states_pass2(
+    model,
+    tokenizer,
+    prompt_text: str,
+    generated_ids: List[int],
+    layers: List[int],
+    step_token_seq: List[int],
+    hash_token_seq: List[int],
+    close_think_seq: List[int],
+    max_input_length: int,
+    thinking_model: bool = False,
+) -> Tuple[str, List[Dict[str, Any]], Dict[int, Dict[str, List[torch.Tensor]]]]:
+    """Single forward pass over prompt + generated tokens to extract hidden states.
+
+    Reconstructs the full sequence from the (unpadded) prompt tokens and the
+    pre-generated token IDs, then runs one forward pass with
+    output_hidden_states=True.  Two extraction approaches are computed:
+
+    "marker" — h^(l)_{t(Step k) - 1}:
+        Hidden state at the token immediately preceding the anchor.
+
+    "mean" — mean over the step span:
+        Mean of hidden states across all token positions in the step span
+        [rel_pos, next_rel_pos).
+
+    Returns:
+        generated_text        : decoded generated text
+        anchor_steps          : list of dicts, one per anchor
+        per_layer_step_hiddens: {layer: {"marker": [...], "mean": [...]}}
+    """
     if not generated_ids:
-        return "", [], [], {layer: {"marker": [], "mean": []} for layer in layers}
+        return "", [], {layer: {"marker": [], "mean": []} for layer in layers}
 
-    # --- Pass 2: single forward pass over the full sequence ---
+    inputs = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_input_length,
+    )
+    input_ids = inputs["input_ids"].to(model.device)
+    prompt_length = input_ids.shape[1]
+
+    gen_tensor = torch.tensor([generated_ids], dtype=torch.long, device=model.device)
+    full_ids = torch.cat([input_ids, gen_tensor], dim=1)
     full_attn = torch.ones(1, full_ids.shape[1], dtype=torch.long, device=model.device)
+
     fwd = model(
         input_ids=full_ids,
         attention_mask=full_attn,
@@ -464,27 +507,23 @@ def generate_twopass_with_hidden_states(
         use_cache=False,
         return_dict=True,
     )
-    # fwd.hidden_states: tuple of (num_layers + 1) tensors, each [1, seq_len, hidden_dim]
-    # Index 0 = embedding output; indices 1..N = transformer layer outputs.
 
-    # --- Locate </think> boundary (relative to generated sequence) ---
+    # --- Locate </think> boundary ---
     think_close_rel = -1
     if thinking_model and close_think_seq:
         think_close_rel = find_subseq(generated_ids, close_think_seq)
 
-    # --- Locate all "Step" anchors ---
-    # For thinking models: only before </think>.
-    # For standard models: across the entire generated sequence.
+    # --- Locate Step anchors ---
     step_search_end = think_close_rel if (thinking_model and think_close_rel >= 0) else len(generated_ids)
     step_positions = find_all_subseq(generated_ids, step_token_seq, stop_before=step_search_end)
 
-    # --- Locate "####" answer anchor ---
+    # --- Locate #### anchor ---
     hash_search_start = 0
     if thinking_model and think_close_rel >= 0:
         hash_search_start = think_close_rel + len(close_think_seq)
     hash_pos = find_subseq(generated_ids, hash_token_seq, hash_search_start)
 
-    # --- Build ordered anchor list: (rel_pos, anchor_type, section) ---
+    # --- Build ordered anchor list ---
     anchor_positions: List[Tuple[int, str, str]] = []
     for sp in step_positions:
         section = "thinking" if (thinking_model and think_close_rel >= 0) else "response"
@@ -496,9 +535,9 @@ def generate_twopass_with_hidden_states(
     if not anchor_positions:
         logger.warning("No Step markers or #### found in generated sequence.")
         generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-        return generated_text, generated_ids, [], {layer: {"marker": [], "mean": []} for layer in layers}
+        return generated_text, [], {layer: {"marker": [], "mean": []} for layer in layers}
 
-    # --- Extract both hidden-state approaches for each anchor ---
+    # --- Extract hidden states ---
     anchor_steps: List[Dict[str, Any]] = []
     per_layer_step_hiddens: Dict[int, Dict[str, List[torch.Tensor]]] = {
         layer: {"marker": [], "mean": []} for layer in layers
@@ -506,11 +545,10 @@ def generate_twopass_with_hidden_states(
 
     for i, (rel_pos, anchor_type, section) in enumerate(anchor_positions):
         full_pos = prompt_length + rel_pos
-        hidden_pos = full_pos - 1          # token immediately preceding the anchor
+        hidden_pos = full_pos - 1
         if hidden_pos < 0:
             continue
 
-        # Step span: from this anchor up to (not including) the next anchor
         next_rel = anchor_positions[i + 1][0] if i + 1 < len(anchor_positions) else len(generated_ids)
         step_text = tokenizer.decode(
             generated_ids[rel_pos:next_rel], skip_special_tokens=False
@@ -525,26 +563,23 @@ def generate_twopass_with_hidden_states(
             "token_count": next_rel - rel_pos,
         })
 
-        span_start = prompt_length + rel_pos      # inclusive, in full-sequence coords
-        span_end   = prompt_length + next_rel     # exclusive
+        span_start = prompt_length + rel_pos
+        span_end   = prompt_length + next_rel
 
         for layer in layers:
             if layer >= len(fwd.hidden_states):
                 raise ValueError(
                     f"Requested layer {layer} but model only has {len(fwd.hidden_states)} hidden states."
                 )
-            hs = fwd.hidden_states[layer]         # [1, seq_len, hidden_dim]
+            hs = fwd.hidden_states[layer]
 
-            # Approach 1 — marker: hidden state at (full_pos - 1)
             h_marker = hs[0, hidden_pos, :].detach().cpu()
+            h_mean   = hs[0, span_start:span_end, :].mean(dim=0).detach().cpu()
             per_layer_step_hiddens[layer]["marker"].append(h_marker)
-
-            # Approach 2 — mean: average over all token positions in the step span
-            h_mean = hs[0, span_start:span_end, :].mean(dim=0).detach().cpu()
             per_layer_step_hiddens[layer]["mean"].append(h_mean)
 
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    return generated_text, generated_ids, anchor_steps, per_layer_step_hiddens
+    return generated_text, anchor_steps, per_layer_step_hiddens
 
 
 # -------------------------
@@ -697,138 +732,186 @@ def main():
         for section in ("thinking", "response")
     }
     step_counters: Dict[str, int] = {"thinking": 0, "response": 0}
+    examples_processed = 0
 
-    for local_idx, example in enumerate(tqdm(ds, desc="Processing")):
-        example_idx = args.start_idx + local_idx
+    # -------------------------------------------------------------------------
+    # Main loop — batched Pass 1, per-example Pass 2
+    # -------------------------------------------------------------------------
+    # We collect up to generation_batch_size examples, run Pass 1 on the whole
+    # batch (amortising the autoregressive generation cost), then run Pass 2
+    # individually for each example (sequence lengths differ, hidden states
+    # must be aligned to each example's own token positions).
+    # -------------------------------------------------------------------------
 
-        # --- Extract fields ---
+    batch_data: List[Tuple] = []   # (example_idx, question, ground_truth, is_solvable, prompt)
+
+    def _extract_fields(example):
         if args.dataset_type == "gsm8k":
-            question = example["question"]
-            ground_truth = example.get("answer", "")
-            is_solvable = None
+            return example["question"], example.get("answer", ""), None
         elif args.dataset_type == "aime":
-            question = example.get("problem", example.get("question", ""))
-            ground_truth = example.get("answer", "")
-            is_solvable = None
+            return (example.get("problem", example.get("question", "")),
+                    example.get("answer", ""), None)
         else:
-            question = example.get("problem", example.get("question", ""))
-            ground_truth = example.get("ground_truth", example.get("answer", ""))
-            is_solvable = hardcoded_solvability
+            return (example.get("problem", example.get("question", "")),
+                    example.get("ground_truth", example.get("answer", "")),
+                    hardcoded_solvability)
 
-        # --- Build prompt ---
-        prompt = build_cot_prompt(question)
-        if args.thinking_model and args.force_think_prefix:
-            prompt = prompt + "<think>\n"
+    def _process_batch(batch: List[Tuple]) -> None:
+        nonlocal examples_processed
+        if not batch:
+            return
 
-        # --- Generate + extract hidden states ---
+        prompts = [item[4] for item in batch]
+
+        # --- Pass 1: batched generation ---
         try:
-            _, generated_ids, anchor_steps, per_layer_hiddens = generate_twopass_with_hidden_states(
+            all_generated_ids = batch_generate_pass1(
                 model=model,
                 tokenizer=tokenizer,
-                prompt_text=prompt,
-                layers=args.layers,
-                step_token_seq=step_token_seq,
-                hash_token_seq=hash_token_seq,
-                close_think_seq=close_think_seq,
+                prompt_texts=prompts,
                 max_input_length=args.max_input_length,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 do_sample=args.do_sample,
                 top_p=args.top_p,
-                thinking_model=args.thinking_model,
             )
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.warning(f"OOM at example {example_idx}, skipping")
+                logger.warning(f"OOM during batch Pass 1 (batch size {len(batch)}), skipping batch")
                 torch.cuda.empty_cache()
-                continue
+                return
             raise
 
-        if not anchor_steps:
-            logger.warning(f"Example {example_idx}: no anchors detected, skipping")
-            continue
+        # --- Pass 2: per-example hidden state extraction ---
+        for i, (example_idx, question, ground_truth, is_solvable, prompt) in enumerate(batch):
+            generated_ids = all_generated_ids[i]
 
-        # --- TTS computation (optional, only for GSM8K/AIME, not ReliableMath) ---
-        # Build a lookup from anchor_idx → TTS dict so we can merge into metadata below.
-        tts_by_anchor: Dict[int, Dict[str, float]] = {}
-        should_compute_tts = (
-            args.compute_tts
-            and "reliablemath" not in args.dataset_type
-            and ground_truth
-        )
-        if should_compute_tts:
+            if not generated_ids:
+                logger.warning(f"Example {example_idx}: empty generation, skipping")
+                continue
+
             try:
-                tts_list = compute_tts_scores(
+                _, anchor_steps, per_layer_hiddens = extract_hidden_states_pass2(
                     model=model,
                     tokenizer=tokenizer,
-                    prompt=prompt,
-                    anchor_steps=anchor_steps,
+                    prompt_text=prompt,
                     generated_ids=generated_ids,
-                    ground_truth=str(ground_truth),
-                    early_exit_suffix=args.tts_early_exit_suffix,
-                    max_new_tokens=args.tts_max_new_tokens,
-                    a=0.5,
-                    b=0.5,
-                    random_seed=args.tts_random_seed,
+                    layers=args.layers,
+                    step_token_seq=step_token_seq,
+                    hash_token_seq=hash_token_seq,
+                    close_think_seq=close_think_seq,
+                    max_input_length=args.max_input_length,
+                    thinking_model=args.thinking_model,
                 )
-                for t in tts_list:
-                    tts_by_anchor[t["anchor_idx"]] = t
-            except Exception as e:
-                logger.warning(f"TTS failed for example {example_idx}: {e}")
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"OOM at Pass 2 for example {example_idx}, skipping")
+                    torch.cuda.empty_cache()
+                    continue
+                raise
 
-        # --- Store each anchor's hidden state and metadata ---
-        for anchor_idx, anchor in enumerate(anchor_steps):
-            section = anchor["section"]
-            global_step_idx = step_counters[section]
+            if not anchor_steps:
+                logger.warning(f"Example {example_idx}: no anchors detected, skipping")
+                continue
 
-            tts_entry = tts_by_anchor.get(anchor_idx, {})
-            meta_record: Dict[str, Any] = {
-                "step_global_idx": global_step_idx,
-                "example_idx": example_idx,
-                "section": section,
-                "anchor_type": anchor["anchor_type"],   # "step" or "answer"
-                "step_text": anchor["step_text"],
-                "rel_pos": anchor["rel_pos"],
-                "hidden_pos": anchor["hidden_pos"],
-                "token_count": anchor["token_count"],
-                "question": question,
-                "ground_truth": ground_truth,
-                "is_solvable": is_solvable,
-            }
-            if tts_entry:
-                meta_record["tts"] = tts_entry["tts"]
-                meta_record["ate1"] = tts_entry["ate1"]
-                meta_record["ate0"] = tts_entry["ate0"]
-                meta_record["p_no_perturb"] = tts_entry["p_no_perturb"]
-                meta_record["p_perturb_s"] = tts_entry["p_perturb_s"]
-                meta_record["p_perturb_c"] = tts_entry["p_perturb_c"]
-                meta_record["p_perturb_sc"] = tts_entry["p_perturb_sc"]
-                # Classification matching tts.py thresholds
-                tts_val = tts_entry["tts"]
-                if tts_val <= args.tts_threshold_low:
-                    meta_record["tts_label"] = "decorative"
-                elif tts_val > args.tts_threshold_high:
-                    meta_record["tts_label"] = "true_thinking"
-                else:
-                    meta_record["tts_label"] = "ambiguous"
-            metadata[section].append(meta_record)
+            # --- TTS (optional, GSM8K/AIME only) ---
+            tts_by_anchor: Dict[int, Dict[str, float]] = {}
+            should_compute_tts = (
+                args.compute_tts
+                and "reliablemath" not in args.dataset_type
+                and ground_truth
+            )
+            if should_compute_tts:
+                try:
+                    tts_list = compute_tts_scores(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt=prompt,
+                        anchor_steps=anchor_steps,
+                        generated_ids=generated_ids,
+                        ground_truth=str(ground_truth),
+                        early_exit_suffix=args.tts_early_exit_suffix,
+                        max_new_tokens=args.tts_max_new_tokens,
+                        a=0.5,
+                        b=0.5,
+                        random_seed=args.tts_random_seed,
+                    )
+                    for t in tts_list:
+                        tts_by_anchor[t["anchor_idx"]] = t
+                except Exception as e:
+                    logger.warning(f"TTS failed for example {example_idx}: {e}")
 
-            for layer in args.layers:
-                for approach in ("marker", "mean"):
-                    h = per_layer_hiddens[layer][approach][anchor_idx].float().numpy()
-                    hidden_states[section][approach][layer][global_step_idx] = h
+            # --- Store metadata + hidden states ---
+            for anchor_idx, anchor in enumerate(anchor_steps):
+                section = anchor["section"]
+                global_step_idx = step_counters[section]
 
-            step_counters[section] += 1
+                tts_entry = tts_by_anchor.get(anchor_idx, {})
+                meta_record: Dict[str, Any] = {
+                    "step_global_idx": global_step_idx,
+                    "example_idx": example_idx,
+                    "section": section,
+                    "anchor_type": anchor["anchor_type"],
+                    "step_text": anchor["step_text"],
+                    "rel_pos": anchor["rel_pos"],
+                    "hidden_pos": anchor["hidden_pos"],
+                    "token_count": anchor["token_count"],
+                    "question": question,
+                    "ground_truth": ground_truth,
+                    "is_solvable": is_solvable,
+                }
+                if tts_entry:
+                    meta_record["tts"] = tts_entry["tts"]
+                    meta_record["ate1"] = tts_entry["ate1"]
+                    meta_record["ate0"] = tts_entry["ate0"]
+                    meta_record["p_no_perturb"] = tts_entry["p_no_perturb"]
+                    meta_record["p_perturb_s"] = tts_entry["p_perturb_s"]
+                    meta_record["p_perturb_c"] = tts_entry["p_perturb_c"]
+                    meta_record["p_perturb_sc"] = tts_entry["p_perturb_sc"]
+                    tts_val = tts_entry["tts"]
+                    if tts_val <= args.tts_threshold_low:
+                        meta_record["tts_label"] = "decorative"
+                    elif tts_val > args.tts_threshold_high:
+                        meta_record["tts_label"] = "true_thinking"
+                    else:
+                        meta_record["tts_label"] = "ambiguous"
+                metadata[section].append(meta_record)
 
-        # --- Periodic checkpoint ---
-        if (local_idx + 1) % args.save_every == 0:
+                for layer in args.layers:
+                    for approach in ("marker", "mean"):
+                        h = per_layer_hiddens[layer][approach][anchor_idx].float().numpy()
+                        hidden_states[section][approach][layer][global_step_idx] = h
+
+                step_counters[section] += 1
+
+            examples_processed += 1
+
+        # --- Periodic checkpoint (at batch boundary) ---
+        if examples_processed % args.save_every == 0 and examples_processed > 0:
             logger.info(
-                f"Checkpoint {local_idx + 1}/{len(ds)} | "
+                f"Checkpoint {examples_processed}/{len(ds)} | "
                 f"thinking={step_counters['thinking']} response={step_counters['response']}"
             )
             _flush(metadata, hidden_states, output_dir, dataset_tag,
                    args.start_idx, end_idx, args.layers, args.save_float16,
                    args.tts_threshold_low, args.tts_threshold_high)
+
+    for local_idx, example in enumerate(tqdm(ds, desc="Processing")):
+        example_idx = args.start_idx + local_idx
+        question, ground_truth, is_solvable = _extract_fields(example)
+        prompt = build_cot_prompt(question)
+        if args.thinking_model and args.force_think_prefix:
+            prompt = prompt + "<think>\n"
+
+        batch_data.append((example_idx, question, ground_truth, is_solvable, prompt))
+
+        if len(batch_data) == args.generation_batch_size:
+            _process_batch(batch_data)
+            batch_data = []
+
+    # Flush any remaining partial batch
+    if batch_data:
+        _process_batch(batch_data)
 
     # --- Final save ---
     logger.info("=== Final save ===")

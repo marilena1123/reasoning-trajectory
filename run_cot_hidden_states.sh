@@ -50,6 +50,10 @@ MAX_INPUT_LENGTH=2048
 MAX_NEW_TOKENS=2048
 DTYPE="bfloat16"
 ATTN_IMPL="sdpa"
+# Number of examples to generate in parallel (Pass 1 only).
+# Pass 2 (hidden-state extraction) is always per-example.
+# With 4 GPUs and ~8B model, 4-8 is a reasonable starting point.
+GENERATION_BATCH_SIZE=4
 
 # Checkpoint frequency (examples between saves)
 SAVE_EVERY=100
@@ -130,6 +134,7 @@ echo "Layers:         $LAYERS"
 echo "Max Tokens:     $MAX_NEW_TOKENS"
 echo "Start Index:    $START_IDX"
 echo "End Index:      $END_IDX"
+echo "Batch size:     $GENERATION_BATCH_SIZE"
 echo "TTS:            ${TTS_FLAGS:-disabled}"
 echo "Thinking model: ${THINKING_FLAGS:-no}"
 echo "========================================"
@@ -153,6 +158,7 @@ python cot_hidden_states.py \
   --dtype         "$DTYPE" \
   --attn_implementation "$ATTN_IMPL" \
   --save_every    "$SAVE_EVERY" \
+  --generation_batch_size "$GENERATION_BATCH_SIZE" \
   $SAVE_FLOAT16 \
   $THINKING_FLAGS \
   $TTS_FLAGS
