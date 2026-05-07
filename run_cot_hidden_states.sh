@@ -163,12 +163,12 @@ python cot_hidden_states.py \
   --dtype         "$DTYPE" \
   --attn_implementation "$ATTN_IMPL" \
   --save_every    "$SAVE_EVERY" \
-  --generation_batch_size "$GENERATION_BATCH_SIZE" \
-  $USE_VLLM \
+  ${GENERATION_BATCH_SIZE:+--generation_batch_size "$GENERATION_BATCH_SIZE"} \
+  ${USE_VLLM:+$USE_VLLM} \
   ${USE_VLLM:+--vllm_tensor_parallel_size "$VLLM_TENSOR_PARALLEL"} \
   ${USE_VLLM:+--vllm_gpu_memory_utilization "$VLLM_GPU_MEM_UTIL"} \
-  $SAVE_FLOAT16 \
-  $THINKING_FLAGS \
+  ${SAVE_FLOAT16:+$SAVE_FLOAT16} \
+  ${THINKING_FLAGS:+$THINKING_FLAGS} \
   $TTS_FLAGS
 
 # =========================================================================
