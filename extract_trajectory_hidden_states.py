@@ -5,17 +5,30 @@ Extracts hidden states faithfully to the paper methodology:
 - h(ℓ)_t(Step k)−1: Hidden state at token preceding each "Step" marker
 - h(ℓ)_t(term)−1: Hidden state at token preceding final answer marker "####"
 
+EXPECTED OUTPUT FORMAT:
+The script expects model outputs in the following format:
+    Step 1: [reasoning text]
+    Step 2: [reasoning text]
+    Step 3: [reasoning text]
+    #### [final answer]
+
+This format is enforced by the prompt (see --thinking_model flag).
+
 Handles three dataset types:
 1. ReliableMath (unsol.parquet) - with solvability tags
 2. ReliableMath (solve.parquet) - with solvability tags
 3. GSM8K / AIME - no solvability tags
 
 Features:
-- Generates CoT responses
+- Generates CoT responses with explicit Step X: format
 - Extracts thinking/response sections (for thinking models)
 - Identifies Step markers and final answer marker
 - Extracts hidden states at precise positions: preceding each marker
 - Saves trajectory snapshots: metadata (JSON) + hidden states (NPZ)
+
+NOTE: Models are prompted to generate the Step X: format explicitly.
+      If your model doesn't follow this format naturally, you may need
+      to adjust the prompt template in the code.
 """
 
 import re
@@ -578,12 +591,32 @@ def main():
             ground_truth = example.get("ground_truth", example.get("answer", ""))
             is_solvable = example.get(solvability_field, None)
 
-        # Build prompt
-        prompt = f"""Problem: {question}
+        # Build prompt with explicit Step format
+        # Models are expected to generate: "Step 1: ...\nStep 2: ...\n#### answer"
+        if args.thinking_model:
+            # For thinking models (DeepSeek R1, Claude-with-thinking)
+            prompt = f"""<think>
+{question}
 
-Solve the problem step-by-step.
-Answer:
-"""
+I need to solve this step-by-step.
+</think>
+
+Problem: {question}
+
+Step 1: """
+        else:
+            # For standard instruction-tuned models (Llama-3.1-8B-Instruct, etc.)
+            # Prompt explicitly requests Step X: format
+            prompt = f"""Problem: {question}
+
+Please solve this problem step-by-step using the following format:
+Step 1: [first step]
+Step 2: [second step]
+...
+#### [final answer]
+
+Solution:
+Step 1: """
 
         # Generate with hidden states
         try:
@@ -616,7 +649,11 @@ Answer:
         trajectory_points = extract_trajectory_points(generated_ids, tokenizer)
 
         if not trajectory_points:
-            logger.debug(f"No trajectory points found in example {example_idx}")
+            logger.warning(
+                f"No trajectory points found in example {example_idx}. "
+                f"Model may not be generating 'Step X:' or '####' format. "
+                f"Sample output: {generated_text[:200]}..."
+            )
             continue
 
         # Process each trajectory point
