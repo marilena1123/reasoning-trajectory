@@ -1,0 +1,711 @@
+"""
+Unified CoT Generation + Hidden State Extraction + Trajectory Extraction Pipeline
+
+Extracts hidden states faithfully to the paper methodology:
+- h(ℓ)_t(Step k)−1: Hidden state at token preceding each "Step" marker
+- h(ℓ)_t(term)−1: Hidden state at token preceding final answer marker "####"
+
+Handles three dataset types:
+1. ReliableMath (unsol.parquet) - with solvability tags
+2. ReliableMath (solve.parquet) - with solvability tags
+3. GSM8K / AIME - no solvability tags
+
+Features:
+- Generates CoT responses
+- Extracts thinking/response sections (for thinking models)
+- Identifies Step markers and final answer marker
+- Extracts hidden states at precise positions: preceding each marker
+- Saves trajectory snapshots: metadata (JSON) + hidden states (NPZ)
+"""
+
+import re
+import json
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple, Any, Optional
+from dataclasses import dataclass, asdict
+from collections import defaultdict
+
+import numpy as np
+import torch
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+# -------------------------
+# Constants
+# -------------------------
+
+STEP_TOKEN_ID = 8468  # Token ID for "Step" (with capital S)
+STEP_MARKER = "Step"
+FINAL_ANSWER_MARKER = "####"
+
+
+# -------------------------
+# Data structures
+# -------------------------
+
+@dataclass
+class TrajectoryPoint:
+    """Single point in the reasoning trajectory"""
+    point_type: str  # "step" or "final_answer"
+    step_num: Optional[int]  # Which step (0-indexed) for "step" type
+    token_position: int  # Position in full sequence (absolute)
+    hidden_pos: int  # Position from which hidden state was extracted (token_position - 1)
+    marker_text: str  # Text of the marker ("Step 1", "####", etc.)
+
+
+@dataclass
+class Section:
+    """Thinking or response section"""
+    name: str  # "thinking" or "response"
+    text: str
+    start_token: int
+    end_token: int
+
+
+@dataclass
+class Example:
+    """Single example with generated CoT and trajectory"""
+    example_idx: int
+    question: str
+    answer: str
+    full_generated_text: str
+    generated_token_ids: List[int]
+    thinking_section: Optional[Section]
+    response_section: Optional[Section]
+    trajectory_points: List[TrajectoryPoint]
+    ground_truth: Optional[str]
+    is_solvable: Optional[bool]
+    per_layer_hidden_states: Dict[int, Dict[int, torch.Tensor]]  # {layer: {hidden_pos: tensor}}
+
+
+# -------------------------
+# Arguments
+# -------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Unified CoT generation + trajectory hidden state extraction pipeline"
+    )
+
+    # Model & data
+    parser.add_argument("--model_path", type=str, required=True, help="Model path/ID")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Dataset path (parquet or directory)")
+    parser.add_argument("--dataset_type", type=str, required=True,
+                       choices=["reliablemath_unsol", "reliablemath_sol", "gsm8k", "aime"],
+                       help="Dataset type")
+
+    # Output
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory")
+    parser.add_argument("--split", type=str, default="test", help="Dataset split (for some datasets)")
+
+    # Processing
+    parser.add_argument("--layers", type=int, nargs="+", required=True, help="Layer indices to extract")
+    parser.add_argument("--max_input_length", type=int, default=2048)
+    parser.add_argument("--max_new_tokens", type=int, default=2048)
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    parser.add_argument("--attn_implementation", type=str, default="sdpa")
+
+    # Generation
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--top_p", type=float, default=1.0)
+
+    # Thinking model
+    parser.add_argument("--thinking_model", action="store_true", help="Model generates <think>...</think>")
+    parser.add_argument("--force_think_prefix", action="store_true", help="Append <think>\\n to prompt")
+
+    # Saving
+    parser.add_argument("--save_float16", action="store_true", help="Save hidden states as float16")
+    parser.add_argument("--save_every", type=int, default=10, help="Checkpoint frequency")
+
+    parser.add_argument("--start_idx", type=int, default=0)
+    parser.add_argument("--end_idx", type=int, default=None)
+    parser.add_argument("--num_examples", type=int, default=None, help="Max examples to process")
+
+    return parser.parse_args()
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def get_torch_dtype(dtype_str: str):
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    if dtype_str not in dtype_map:
+        raise ValueError(f"Unsupported dtype: {dtype_str}")
+    return dtype_map[dtype_str]
+
+
+def parse_thinking_and_response(
+    generated_text: str,
+    thinking_model: bool,
+    force_think_prefix: bool,
+) -> Tuple[Optional[str], str]:
+    """Extract thinking and response sections"""
+    if not thinking_model:
+        return None, generated_text
+
+    open_tag = "<think>"
+    close_tag = "</think>"
+
+    open_idx = generated_text.find(open_tag)
+    close_idx = generated_text.find(close_tag)
+
+    # Case 1: Explicit tags
+    if open_idx != -1 and close_idx != -1 and close_idx > open_idx:
+        thinking_text = generated_text[open_idx + len(open_tag):close_idx].strip()
+        response_text = generated_text[close_idx + len(close_tag):].strip()
+        return thinking_text, response_text
+
+    # Case 2: force_think_prefix (no opening tag)
+    if force_think_prefix and close_idx != -1:
+        thinking_text = generated_text[:close_idx].strip()
+        response_text = generated_text[close_idx + len(close_tag):].strip()
+        return thinking_text, response_text
+
+    # Case 3: No usable tags
+    logger.warning("thinking_model=True but no tags found. Treating as response.")
+    return None, generated_text
+
+
+# -------------------------
+# Trajectory Detection
+# -------------------------
+
+def find_step_markers(generated_ids: List[int], tokenizer) -> List[Tuple[int, str]]:
+    """Find all "Step" markers in generated sequence
+
+    Returns:
+        List of (token_position, marker_text) tuples
+    """
+    step_positions = []
+    step_prefix = tokenizer.encode(STEP_MARKER, add_special_tokens=False)
+
+    if not step_prefix:
+        return step_positions
+
+    # Search for "Step" token(s)
+    for i in range(len(generated_ids) - len(step_prefix) + 1):
+        if generated_ids[i:i+len(step_prefix)] == step_prefix:
+            # Found "Step" marker
+            # Try to extract the step number (e.g., "Step 1", "Step 2")
+            marker_text = STEP_MARKER
+
+            # Look ahead for digit(s)
+            j = i + len(step_prefix)
+            digits = []
+            while j < len(generated_ids):
+                digit_token = tokenizer.decode([generated_ids[j]])
+                if digit_token.strip().isdigit():
+                    digits.append(digit_token.strip())
+                    j += 1
+                elif digit_token.strip() == "":
+                    j += 1
+                    continue
+                else:
+                    break
+
+            if digits:
+                marker_text += " " + "".join(digits)
+
+            step_positions.append((i, marker_text))
+
+    return step_positions
+
+
+def find_final_answer_marker(generated_ids: List[int], tokenizer) -> Optional[Tuple[int, str]]:
+    """Find the first occurrence of final answer marker (####)
+
+    Returns:
+        (token_position, marker_text) or None
+    """
+    hash_marker = tokenizer.encode(FINAL_ANSWER_MARKER, add_special_tokens=False)
+
+    if not hash_marker:
+        return None
+
+    # Search for "####" marker
+    for i in range(len(generated_ids) - len(hash_marker) + 1):
+        if generated_ids[i:i+len(hash_marker)] == hash_marker:
+            return (i, FINAL_ANSWER_MARKER)
+
+    return None
+
+
+def extract_trajectory_points(
+    generated_ids: List[int],
+    tokenizer,
+) -> List[TrajectoryPoint]:
+    """Extract trajectory points: positions preceding Step markers and final answer marker
+
+    Returns:
+        Ordered list of TrajectoryPoint objects
+    """
+    points = []
+
+    # Find all Step markers
+    step_markers = find_step_markers(generated_ids, tokenizer)
+    for step_num, (token_pos, marker_text) in enumerate(step_markers):
+        if token_pos > 0:  # Can only extract hidden state if position > 0
+            points.append(TrajectoryPoint(
+                point_type="step",
+                step_num=step_num,
+                token_position=token_pos,
+                hidden_pos=token_pos - 1,  # h(ℓ)_t(Step k)−1
+                marker_text=marker_text,
+            ))
+
+    # Find final answer marker
+    final_answer = find_final_answer_marker(generated_ids, tokenizer)
+    if final_answer is not None:
+        token_pos, marker_text = final_answer
+        if token_pos > 0:  # Can only extract hidden state if position > 0
+            points.append(TrajectoryPoint(
+                point_type="final_answer",
+                step_num=None,
+                token_position=token_pos,
+                hidden_pos=token_pos - 1,  # h(ℓ)_t(term)−1
+                marker_text=marker_text,
+            ))
+
+    return points
+
+
+# -------------------------
+# Generation with hidden states
+# -------------------------
+
+@torch.no_grad()
+def generate_with_hidden_states(
+    model,
+    tokenizer,
+    prompt_text: str,
+    layers: List[int],
+    max_input_length: int,
+    max_new_tokens: int,
+    temperature: float = 0.0,
+    do_sample: bool = False,
+    top_p: float = 1.0,
+) -> Tuple[str, List[int], Dict[int, List[torch.Tensor]]]:
+    """Generate text and capture hidden states for all tokens
+
+    Returns:
+        (generated_text, generated_ids, per_layer_hidden_states)
+        where per_layer_hidden_states[layer] = [hidden_state_0, hidden_state_1, ...]
+        (one tensor per generated token)
+    """
+
+    inputs = tokenizer(
+        prompt_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=max_input_length,
+    )
+
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
+    prompt_len = input_ids.shape[1]
+
+    # Initial forward pass
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+
+    past_key_values = outputs.past_key_values
+    logits = outputs.logits[:, -1, :]
+    eos_token_id = tokenizer.eos_token_id
+
+    generated_ids: List[int] = []
+    per_layer_token_hiddens: Dict[int, List[torch.Tensor]] = {layer: [] for layer in layers}
+
+    for step_num in range(max_new_tokens):
+        # Sample next token
+        if do_sample:
+            if temperature <= 0:
+                raise ValueError("temperature must be > 0 when do_sample=True")
+
+            logits_scaled = logits / temperature
+
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits_scaled, descending=True)
+                probs = torch.softmax(sorted_logits, dim=-1)
+                cumulative_probs = torch.cumsum(probs, dim=-1)
+
+                sorted_remove = cumulative_probs > top_p
+                sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+                sorted_remove[..., 0] = 0
+
+                remove_mask = sorted_remove.scatter(1, sorted_indices, sorted_remove)
+                logits_scaled = logits_scaled.masked_fill(remove_mask, float("-inf"))
+
+            probs = torch.softmax(logits_scaled, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+        else:
+            next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+        next_token_id = next_token.item()
+
+        if eos_token_id is not None and next_token_id == eos_token_id:
+            break
+
+        # Forward pass for next token
+        outputs = model(
+            input_ids=next_token,
+            past_key_values=past_key_values,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        past_key_values = outputs.past_key_values
+        logits = outputs.logits[:, -1, :]
+        hidden_states = outputs.hidden_states
+
+        # Collect hidden states from the output position
+        for layer in layers:
+            if layer < 0 or layer >= len(hidden_states):
+                raise ValueError(f"Invalid layer {layer}")
+            # hidden_states[layer] shape: [batch_size, 1, hidden_dim]
+            # We want the last token's hidden state
+            hidden_vec = hidden_states[layer][0, -1, :].detach().cpu()
+            per_layer_token_hiddens[layer].append(hidden_vec)
+
+        generated_ids.append(next_token_id)
+
+    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    return generated_text, generated_ids, per_layer_token_hiddens
+
+
+# -------------------------
+# Dataset loading
+# -------------------------
+
+def load_dataset_by_type(dataset_type: str, dataset_path: str, split: str = "test"):
+    """Load dataset based on type"""
+    logger.info(f"Loading {dataset_type} from {dataset_path}")
+
+    if "reliablemath" in dataset_type:
+        # Parquet file
+        ds = load_dataset("parquet", data_files=dataset_path)["train"]
+        logger.info(f"Loaded {len(ds)} examples from ReliableMath")
+        return ds
+
+    elif dataset_type == "gsm8k":
+        # GSM8K from HF
+        ds = load_dataset("openai/gsm8k", "main", split=split)
+        logger.info(f"Loaded {len(ds)} examples from GSM8K")
+        return ds
+
+    elif dataset_type == "aime":
+        # AIME - assume local directory or specific format
+        if Path(dataset_path).is_dir():
+            parquet_files = list(Path(dataset_path).glob("*.parquet"))
+            if parquet_files:
+                ds = load_dataset("parquet", data_files=str(parquet_files[0]))["train"]
+                logger.info(f"Loaded {len(ds)} examples from AIME")
+                return ds
+
+        ds = load_dataset("parquet", data_files=dataset_path)["train"]
+        logger.info(f"Loaded {len(ds)} examples from AIME")
+        return ds
+
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
+
+
+# -------------------------
+# Metadata saving
+# -------------------------
+
+def save_trajectory_metadata(
+    trajectory_data: List[Dict[str, Any]],
+    output_dir: Path,
+    dataset_tag: str,
+    start_idx: int,
+    end_idx: Optional[int],
+):
+    """Save trajectory metadata to JSON"""
+    chunk_end = end_idx if end_idx is not None else "end"
+    filename = output_dir / f"trajectory_{dataset_tag}_{start_idx}_{chunk_end}_metadata.json"
+
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(trajectory_data, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"Saved {len(trajectory_data)} trajectory points to {filename}")
+
+
+def save_trajectory_hidden_states(
+    trajectory_hidden_states: List[Dict[str, Any]],
+    output_dir: Path,
+    dataset_tag: str,
+    layer: int,
+    start_idx: int,
+    end_idx: Optional[int],
+    save_float16: bool,
+):
+    """Save hidden states to NPZ"""
+    out_dtype = np.float16 if save_float16 else np.float32
+    chunk_end = end_idx if end_idx is not None else "end"
+
+    hidden_vecs = []
+    point_indices = []
+
+    for point_idx, data in enumerate(trajectory_hidden_states):
+        if "hidden_state" in data:
+            hidden_vecs.append(data["hidden_state"])
+            point_indices.append(point_idx)
+
+    if hidden_vecs:
+        hidden_arr = np.array(hidden_vecs, dtype=out_dtype)
+    else:
+        hidden_arr = np.zeros((0, 0), dtype=out_dtype)
+
+    filename = output_dir / f"trajectory_{dataset_tag}_{start_idx}_{chunk_end}_layer{layer}.npz"
+
+    np.savez(
+        str(filename),
+        hidden_states=hidden_arr,
+        point_indices=np.array(point_indices, dtype=np.int32)
+    )
+
+    logger.info(f"Saved {len(hidden_vecs)} trajectory points for layer {layer}")
+
+
+# -------------------------
+# Main processing
+# -------------------------
+
+def main():
+    args = parse_args()
+
+    # Setup
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    torch_dtype = get_torch_dtype(args.dtype)
+
+    # Determine dataset tag and solvability field
+    if "reliablemath" in args.dataset_type:
+        dataset_tag = "reliablemath"
+        if "unsol" in args.dataset_type:
+            solvability_field = "unsolvable"
+        else:
+            solvability_field = "solvable"
+    elif args.dataset_type == "gsm8k":
+        dataset_tag = "gsm8k"
+        solvability_field = None
+    elif args.dataset_type == "aime":
+        dataset_tag = "aime"
+        solvability_field = None
+    else:
+        raise ValueError(f"Unknown dataset type: {args.dataset_type}")
+
+    logger.info(f"Dataset tag: {dataset_tag}, Solvability field: {solvability_field}")
+
+    # Load model and tokenizer
+    logger.info("Loading model and tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_path,
+        torch_dtype=torch_dtype,
+        device_map="auto",
+        attn_implementation=args.attn_implementation,
+    )
+    model.eval()
+
+    num_layers = getattr(model.config, "num_hidden_layers", None)
+    logger.info(f"Model has {num_layers} layers. Extracting: {args.layers}")
+
+    # Validate layers
+    if num_layers is not None:
+        invalid = [l for l in args.layers if l < 0 or l >= num_layers]
+        if invalid:
+            raise ValueError(f"Invalid layers: {invalid}")
+
+    # Load dataset
+    logger.info(f"Loading dataset from {args.dataset_path}")
+    ds = load_dataset_by_type(args.dataset_type, args.dataset_path, args.split)
+
+    end_idx = args.end_idx if args.end_idx is not None else len(ds)
+    if args.num_examples:
+        end_idx = min(end_idx, args.start_idx + args.num_examples)
+
+    ds = ds.select(range(args.start_idx, end_idx))
+    logger.info(f"Processing {len(ds)} examples ({args.start_idx}-{end_idx})")
+
+    # Storage
+    trajectory_metadata: List[Dict[str, Any]] = []
+    trajectory_hidden_states: Dict[int, List[Dict[str, Any]]] = {
+        layer: [] for layer in args.layers
+    }
+
+    trajectory_point_counter = 0
+
+    # Process examples
+    for local_idx, example in enumerate(tqdm(ds, desc="Processing")):
+        example_idx = args.start_idx + local_idx
+
+        # Extract fields based on dataset type
+        if args.dataset_type == "gsm8k":
+            question = example["question"]
+            ground_truth = example.get("answer", "")
+            is_solvable = None
+        elif args.dataset_type == "aime":
+            question = example.get("problem", example.get("question", ""))
+            ground_truth = example.get("answer", "")
+            is_solvable = None
+        else:  # ReliableMath
+            question = example.get("problem", example.get("question", ""))
+            ground_truth = example.get("ground_truth", example.get("answer", ""))
+            is_solvable = example.get(solvability_field, None)
+
+        # Build prompt
+        prompt = f"""Problem: {question}
+
+Solve the problem step-by-step.
+Answer:
+"""
+
+        # Generate with hidden states
+        try:
+            generated_text, generated_ids, per_layer_hiddens = generate_with_hidden_states(
+                model=model,
+                tokenizer=tokenizer,
+                prompt_text=prompt,
+                layers=args.layers,
+                max_input_length=args.max_input_length,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                do_sample=args.do_sample,
+                top_p=args.top_p,
+            )
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                logger.warning(f"OOM at example {example_idx}, skipping")
+                torch.cuda.empty_cache()
+                continue
+            raise
+
+        # Parse thinking/response
+        thinking_text, response_text = parse_thinking_and_response(
+            generated_text,
+            thinking_model=args.thinking_model,
+            force_think_prefix=args.force_think_prefix,
+        )
+
+        # Extract trajectory points (Step markers and final answer marker)
+        trajectory_points = extract_trajectory_points(generated_ids, tokenizer)
+
+        if not trajectory_points:
+            logger.debug(f"No trajectory points found in example {example_idx}")
+            continue
+
+        # Process each trajectory point
+        for point in trajectory_points:
+            hidden_pos = point.hidden_pos
+
+            # Verify hidden state is available
+            if hidden_pos < 0 or hidden_pos >= len(per_layer_hiddens[args.layers[0]]):
+                logger.warning(f"Invalid hidden position {hidden_pos} for example {example_idx}")
+                continue
+
+            # Extract hidden states for all layers
+            has_all_layers = True
+            for layer in args.layers:
+                if hidden_pos >= len(per_layer_hiddens[layer]):
+                    has_all_layers = False
+                    break
+
+            if not has_all_layers:
+                logger.warning(f"Missing hidden states for some layers at position {hidden_pos}")
+                continue
+
+            # Save metadata
+            meta = {
+                "point_idx": trajectory_point_counter,
+                "example_idx": example_idx,
+                "point_type": point.point_type,
+                "step_num": point.step_num,
+                "marker_text": point.marker_text,
+                "token_position": point.token_position,
+                "hidden_pos": point.hidden_pos,
+                "question": question,
+                "ground_truth": ground_truth,
+                "is_solvable": is_solvable,
+                "full_generated_text": generated_text,
+            }
+            trajectory_metadata.append(meta)
+
+            # Save hidden states for each layer
+            for layer in args.layers:
+                hidden_vec = per_layer_hiddens[layer][hidden_pos]
+                trajectory_hidden_states[layer].append({
+                    "point_idx": trajectory_point_counter,
+                    "hidden_state": hidden_vec.float().cpu().numpy(),
+                })
+
+            trajectory_point_counter += 1
+
+        # Checkpoint
+        if (local_idx + 1) % args.save_every == 0:
+            logger.info(f"Checkpoint: {local_idx + 1}/{len(ds)} | Trajectory points: {trajectory_point_counter}")
+
+            save_trajectory_metadata(trajectory_metadata, output_dir, dataset_tag, args.start_idx, end_idx)
+
+            for layer in args.layers:
+                save_trajectory_hidden_states(
+                    trajectory_hidden_states[layer],
+                    output_dir,
+                    dataset_tag,
+                    layer,
+                    args.start_idx,
+                    end_idx,
+                    args.save_float16
+                )
+
+    # Final save
+    logger.info("\n=== Final Save ===")
+    save_trajectory_metadata(trajectory_metadata, output_dir, dataset_tag, args.start_idx, end_idx)
+
+    for layer in args.layers:
+        save_trajectory_hidden_states(
+            trajectory_hidden_states[layer],
+            output_dir,
+            dataset_tag,
+            layer,
+            args.start_idx,
+            end_idx,
+            args.save_float16
+        )
+
+    # Save config
+    config_file = output_dir / f"trajectory_{dataset_tag}_{args.start_idx}_{end_idx}_config.json"
+    with open(config_file, "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    logger.info(f"\n=== Complete ===")
+    logger.info(f"Total trajectory points extracted: {trajectory_point_counter}")
+    logger.info(f"Output: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
