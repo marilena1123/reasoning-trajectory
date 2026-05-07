@@ -18,6 +18,7 @@ Handles:
     #### anchor as "response"
 """
 
+import os
 import re
 import json
 import argparse
@@ -27,6 +28,11 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import random
 import re
+
+# Block all HuggingFace network calls — safe on air-gapped HPC nodes.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 import numpy as np
 import torch
@@ -546,20 +552,31 @@ def generate_twopass_with_hidden_states(
 # -------------------------
 
 def load_dataset_by_type(dataset_type: str, dataset_path: str, split: str = "test"):
+    """Load dataset entirely from local files — no network access."""
     logger.info(f"Loading {dataset_type} from {dataset_path}")
-    if "reliablemath" in dataset_type:
-        ds = load_dataset("parquet", data_files=dataset_path)["train"]
-    elif dataset_type == "gsm8k":
-        ds = load_dataset("openai/gsm8k", "main", split=split)
-    elif dataset_type == "aime":
-        if Path(dataset_path).is_dir():
-            parquet_files = list(Path(dataset_path).glob("*.parquet"))
-            ds = load_dataset("parquet", data_files=str(parquet_files[0]))["train"]
+    p = Path(dataset_path)
+
+    if p.is_dir():
+        # Directory: glob for parquet or json files, sorted for determinism.
+        parquet_files = sorted(p.glob("*.parquet"))
+        json_files = sorted(p.glob("*.jsonl")) or sorted(p.glob("*.json"))
+        if parquet_files:
+            ds = load_dataset("parquet", data_files=[str(f) for f in parquet_files])["train"]
+        elif json_files:
+            ds = load_dataset("json", data_files=[str(f) for f in json_files])["train"]
         else:
-            ds = load_dataset("parquet", data_files=dataset_path)["train"]
+            raise FileNotFoundError(f"No .parquet or .jsonl files found in {dataset_path}")
+    elif p.suffix in {".parquet"}:
+        ds = load_dataset("parquet", data_files=str(p))["train"]
+    elif p.suffix in {".jsonl", ".json"}:
+        ds = load_dataset("json", data_files=str(p))["train"]
     else:
-        raise ValueError(f"Unknown dataset type: {dataset_type}")
-    logger.info(f"Loaded {len(ds)} examples")
+        raise ValueError(
+            f"Unsupported dataset_path format: {dataset_path}. "
+            "Provide a .parquet file, a .jsonl/.json file, or a directory containing them."
+        )
+
+    logger.info(f"Loaded {len(ds)} examples from {dataset_path}")
     return ds
 
 
@@ -626,7 +643,7 @@ def main():
 
     # Load model
     logger.info("Loading tokenizer and model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -635,6 +652,7 @@ def main():
         torch_dtype=get_torch_dtype(args.dtype),
         device_map="auto",
         attn_implementation=args.attn_implementation,
+        local_files_only=True,
     )
     model.eval()
 
