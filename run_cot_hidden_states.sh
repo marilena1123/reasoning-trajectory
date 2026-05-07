@@ -50,9 +50,13 @@ MAX_INPUT_LENGTH=2048
 MAX_NEW_TOKENS=2048
 DTYPE="bfloat16"
 ATTN_IMPL="sdpa"
-# Number of examples to generate in parallel (Pass 1 only).
-# Pass 2 (hidden-state extraction) is always per-example.
-# With 4 GPUs and ~8B model, 4-8 is a reasonable starting point.
+# Pass 1 generation backend.
+# Use vLLM (faster) or plain HuggingFace batched generation.
+USE_VLLM="--use_vllm"          # set to "" to fall back to HF batched generation
+VLLM_TENSOR_PARALLEL=4         # number of GPUs for vLLM (match #SBATCH --gres=gpu:N)
+VLLM_GPU_MEM_UTIL=0.85         # fraction of GPU memory vLLM may use
+
+# HF fallback batch size (ignored when USE_VLLM is set).
 GENERATION_BATCH_SIZE=4
 
 # Checkpoint frequency (examples between saves)
@@ -134,7 +138,8 @@ echo "Layers:         $LAYERS"
 echo "Max Tokens:     $MAX_NEW_TOKENS"
 echo "Start Index:    $START_IDX"
 echo "End Index:      $END_IDX"
-echo "Batch size:     $GENERATION_BATCH_SIZE"
+echo "vLLM:           ${USE_VLLM:-disabled (HF batched)}"
+echo "Batch size:     $GENERATION_BATCH_SIZE (HF fallback)"
 echo "TTS:            ${TTS_FLAGS:-disabled}"
 echo "Thinking model: ${THINKING_FLAGS:-no}"
 echo "========================================"
@@ -159,6 +164,9 @@ python cot_hidden_states.py \
   --attn_implementation "$ATTN_IMPL" \
   --save_every    "$SAVE_EVERY" \
   --generation_batch_size "$GENERATION_BATCH_SIZE" \
+  $USE_VLLM \
+  ${USE_VLLM:+--vllm_tensor_parallel_size "$VLLM_TENSOR_PARALLEL"} \
+  ${USE_VLLM:+--vllm_gpu_memory_utilization "$VLLM_GPU_MEM_UTIL"} \
   $SAVE_FLOAT16 \
   $THINKING_FLAGS \
   $TTS_FLAGS

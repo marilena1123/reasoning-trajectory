@@ -78,8 +78,17 @@ def parse_args():
 
     parser.add_argument("--generation_batch_size", type=int, default=1,
                         help="Number of examples to generate in parallel during Pass 1 "
-                             "(Pass 2 hidden-state extraction is always per-example). "
-                             "Increase to amortise generation overhead across examples.")
+                             "(ignored when --use_vllm; Pass 2 is always per-example).")
+
+    # vLLM (Pass 1 only)
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="Use vLLM for Pass 1 generation. vLLM is loaded, generates all "
+                             "prompts at once, then is deleted before the HF model loads for Pass 2. "
+                             "The two models never coexist in GPU memory.")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1,
+                        help="Number of GPUs for vLLM tensor parallelism (default: 1).")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.85,
+                        help="Fraction of GPU memory vLLM may use (default: 0.85).")
     parser.add_argument("--save_float16", action="store_true",
                         help="Save hidden states as float16 (halves disk usage)")
     parser.add_argument("--save_every", type=int, default=10,
@@ -449,6 +458,78 @@ def batch_generate_pass1(
     return all_generated_ids
 
 
+def vllm_generate_all(
+    model_path: str,
+    prompts: List[str],
+    max_new_tokens: int,
+    temperature: float,
+    do_sample: bool,
+    top_p: float,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    dtype: str,
+) -> List[List[int]]:
+    """Generate all prompts with vLLM (Pass 1 only).
+
+    vLLM is loaded, generates every prompt in one call using continuous batching
+    and PagedAttention, then the engine and its GPU memory are released before
+    the HF model is loaded for Pass 2.
+
+    Returns a list of generated token ID lists (prompt tokens excluded),
+    in the same order as `prompts`.
+    """
+    try:
+        from vllm import LLM, SamplingParams
+    except ImportError as exc:
+        raise ImportError(
+            "vLLM is not installed. Install it with 'pip install vllm' or remove --use_vllm."
+        ) from exc
+
+    logger.info(
+        f"Initialising vLLM (tensor_parallel_size={tensor_parallel_size}, "
+        f"gpu_memory_utilization={gpu_memory_utilization})..."
+    )
+    llm = LLM(
+        model=model_path,
+        dtype=dtype,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        trust_remote_code=True,
+        tokenizer_mode="auto",
+    )
+
+    if do_sample and temperature > 0:
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+    else:
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=0.0,
+        )
+
+    logger.info(f"vLLM generating {len(prompts)} prompts...")
+    outputs = llm.generate(prompts, sampling_params)
+
+    all_generated_ids: List[List[int]] = [
+        list(out.outputs[0].token_ids) for out in outputs
+    ]
+
+    # Release vLLM engine + GPU memory before the HF model is loaded.
+    del llm
+    try:
+        from vllm.distributed.parallel_state import destroy_model_parallel
+        destroy_model_parallel()
+    except Exception:
+        pass
+    torch.cuda.empty_cache()
+    logger.info("vLLM engine released.")
+
+    return all_generated_ids
+
+
 # -------------------------
 # Pass 2 — per-example hidden state extraction
 # -------------------------
@@ -677,37 +758,18 @@ def main():
         hardcoded_solvability = None
 
     # Load model
-    logger.info("Loading tokenizer and model...")
+    # Tokenizer is needed for anchor detection in Pass 2 — load it unconditionally.
+    logger.info("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=get_torch_dtype(args.dtype),
-        device_map="auto",
-        attn_implementation=args.attn_implementation,
-        local_files_only=True,
-    )
-    model.eval()
-
-    num_layers = getattr(model.config, "num_hidden_layers", None)
-    logger.info(f"Model has {num_layers} transformer layers. Extracting: {args.layers}")
-    if num_layers is not None:
-        bad = [l for l in args.layers if l < 0 or l > num_layers]
-        if bad:
-            raise ValueError(f"Invalid layer indices: {bad}  (valid: 0..{num_layers})")
-
     # Pre-compute token sequences for anchor detection
-    # "Step" — the word that starts every step marker ("Step 1:", "Step 2:", ...)
     step_token_seq: List[int] = tokenizer.encode("Step", add_special_tokens=False)
-    # "####" — the GSM8K answer delimiter
     hash_token_seq: List[int] = tokenizer.encode("####", add_special_tokens=False)
-    # "</think>" — section boundary for thinking models
     close_think_seq: List[int] = (
         tokenizer.encode("</think>", add_special_tokens=False) if args.thinking_model else []
     )
-
     logger.info(f"'Step'    → token IDs {step_token_seq}")
     logger.info(f"'####'    → token IDs {hash_token_seq}")
     if args.thinking_model:
@@ -721,9 +783,8 @@ def main():
     ds = ds.select(range(args.start_idx, end_idx))
     logger.info(f"Processing examples {args.start_idx}–{end_idx} ({len(ds)} total)")
 
-    # Accumulators keyed by section ("thinking" / "response")
+    # Accumulators
     metadata: Dict[str, List[Dict[str, Any]]] = {"thinking": [], "response": []}
-    # hidden_states[section][approach][layer][global_step_idx] = np.ndarray
     hidden_states: Dict[str, Dict[str, Dict[int, Dict[int, np.ndarray]]]] = {
         section: {
             approach: {layer: {} for layer in args.layers}
@@ -735,15 +796,8 @@ def main():
     examples_processed = 0
 
     # -------------------------------------------------------------------------
-    # Main loop — batched Pass 1, per-example Pass 2
+    # Helper: build prompts + collect metadata for all examples
     # -------------------------------------------------------------------------
-    # We collect up to generation_batch_size examples, run Pass 1 on the whole
-    # batch (amortising the autoregressive generation cost), then run Pass 2
-    # individually for each example (sequence lengths differ, hidden states
-    # must be aligned to each example's own token positions).
-    # -------------------------------------------------------------------------
-
-    batch_data: List[Tuple] = []   # (example_idx, question, ground_truth, is_solvable, prompt)
 
     def _extract_fields(example):
         if args.dataset_type == "gsm8k":
@@ -756,137 +810,132 @@ def main():
                     example.get("ground_truth", example.get("answer", "")),
                     hardcoded_solvability)
 
-    def _process_batch(batch: List[Tuple]) -> None:
+    def _build_all_data() -> List[Tuple]:
+        data = []
+        for local_idx, example in enumerate(tqdm(ds, desc="Building prompts")):
+            example_idx = args.start_idx + local_idx
+            question, ground_truth, is_solvable = _extract_fields(example)
+            prompt = build_cot_prompt(question)
+            if args.thinking_model and args.force_think_prefix:
+                prompt += "<think>\n"
+            data.append((example_idx, question, ground_truth, is_solvable, prompt))
+        return data
+
+    # -------------------------------------------------------------------------
+    # Helper: Pass 2 + TTS + store for a single example
+    # -------------------------------------------------------------------------
+
+    def _process_one(
+        example_idx: int,
+        question: str,
+        ground_truth: str,
+        is_solvable,
+        prompt: str,
+        generated_ids: List[int],
+    ) -> None:
         nonlocal examples_processed
-        if not batch:
+
+        if not generated_ids:
+            logger.warning(f"Example {example_idx}: empty generation, skipping")
             return
 
-        prompts = [item[4] for item in batch]
-
-        # --- Pass 1: batched generation ---
         try:
-            all_generated_ids = batch_generate_pass1(
+            _, anchor_steps, per_layer_hiddens = extract_hidden_states_pass2(
                 model=model,
                 tokenizer=tokenizer,
-                prompt_texts=prompts,
+                prompt_text=prompt,
+                generated_ids=generated_ids,
+                layers=args.layers,
+                step_token_seq=step_token_seq,
+                hash_token_seq=hash_token_seq,
+                close_think_seq=close_think_seq,
                 max_input_length=args.max_input_length,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                do_sample=args.do_sample,
-                top_p=args.top_p,
+                thinking_model=args.thinking_model,
             )
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
-                logger.warning(f"OOM during batch Pass 1 (batch size {len(batch)}), skipping batch")
+                logger.warning(f"OOM at Pass 2 for example {example_idx}, skipping")
                 torch.cuda.empty_cache()
                 return
             raise
 
-        # --- Pass 2: per-example hidden state extraction ---
-        for i, (example_idx, question, ground_truth, is_solvable, prompt) in enumerate(batch):
-            generated_ids = all_generated_ids[i]
+        if not anchor_steps:
+            logger.warning(f"Example {example_idx}: no anchors detected, skipping")
+            return
 
-            if not generated_ids:
-                logger.warning(f"Example {example_idx}: empty generation, skipping")
-                continue
-
+        # --- TTS (optional, GSM8K/AIME only) ---
+        tts_by_anchor: Dict[int, Dict[str, float]] = {}
+        should_compute_tts = (
+            args.compute_tts
+            and "reliablemath" not in args.dataset_type
+            and ground_truth
+        )
+        if should_compute_tts:
             try:
-                _, anchor_steps, per_layer_hiddens = extract_hidden_states_pass2(
+                tts_list = compute_tts_scores(
                     model=model,
                     tokenizer=tokenizer,
-                    prompt_text=prompt,
+                    prompt=prompt,
+                    anchor_steps=anchor_steps,
                     generated_ids=generated_ids,
-                    layers=args.layers,
-                    step_token_seq=step_token_seq,
-                    hash_token_seq=hash_token_seq,
-                    close_think_seq=close_think_seq,
-                    max_input_length=args.max_input_length,
-                    thinking_model=args.thinking_model,
+                    ground_truth=str(ground_truth),
+                    early_exit_suffix=args.tts_early_exit_suffix,
+                    max_new_tokens=args.tts_max_new_tokens,
+                    a=0.5,
+                    b=0.5,
+                    random_seed=args.tts_random_seed,
                 )
-            except RuntimeError as e:
-                if "out of memory" in str(e).lower():
-                    logger.warning(f"OOM at Pass 2 for example {example_idx}, skipping")
-                    torch.cuda.empty_cache()
-                    continue
-                raise
+                for t in tts_list:
+                    tts_by_anchor[t["anchor_idx"]] = t
+            except Exception as e:
+                logger.warning(f"TTS failed for example {example_idx}: {e}")
 
-            if not anchor_steps:
-                logger.warning(f"Example {example_idx}: no anchors detected, skipping")
-                continue
+        # --- Store metadata + hidden states ---
+        for anchor_idx, anchor in enumerate(anchor_steps):
+            section = anchor["section"]
+            global_step_idx = step_counters[section]
 
-            # --- TTS (optional, GSM8K/AIME only) ---
-            tts_by_anchor: Dict[int, Dict[str, float]] = {}
-            should_compute_tts = (
-                args.compute_tts
-                and "reliablemath" not in args.dataset_type
-                and ground_truth
-            )
-            if should_compute_tts:
-                try:
-                    tts_list = compute_tts_scores(
-                        model=model,
-                        tokenizer=tokenizer,
-                        prompt=prompt,
-                        anchor_steps=anchor_steps,
-                        generated_ids=generated_ids,
-                        ground_truth=str(ground_truth),
-                        early_exit_suffix=args.tts_early_exit_suffix,
-                        max_new_tokens=args.tts_max_new_tokens,
-                        a=0.5,
-                        b=0.5,
-                        random_seed=args.tts_random_seed,
-                    )
-                    for t in tts_list:
-                        tts_by_anchor[t["anchor_idx"]] = t
-                except Exception as e:
-                    logger.warning(f"TTS failed for example {example_idx}: {e}")
+            tts_entry = tts_by_anchor.get(anchor_idx, {})
+            meta_record: Dict[str, Any] = {
+                "step_global_idx": global_step_idx,
+                "example_idx": example_idx,
+                "section": section,
+                "anchor_type": anchor["anchor_type"],
+                "step_text": anchor["step_text"],
+                "rel_pos": anchor["rel_pos"],
+                "hidden_pos": anchor["hidden_pos"],
+                "token_count": anchor["token_count"],
+                "question": question,
+                "ground_truth": ground_truth,
+                "is_solvable": is_solvable,
+            }
+            if tts_entry:
+                meta_record["tts"] = tts_entry["tts"]
+                meta_record["ate1"] = tts_entry["ate1"]
+                meta_record["ate0"] = tts_entry["ate0"]
+                meta_record["p_no_perturb"] = tts_entry["p_no_perturb"]
+                meta_record["p_perturb_s"] = tts_entry["p_perturb_s"]
+                meta_record["p_perturb_c"] = tts_entry["p_perturb_c"]
+                meta_record["p_perturb_sc"] = tts_entry["p_perturb_sc"]
+                tts_val = tts_entry["tts"]
+                if tts_val <= args.tts_threshold_low:
+                    meta_record["tts_label"] = "decorative"
+                elif tts_val > args.tts_threshold_high:
+                    meta_record["tts_label"] = "true_thinking"
+                else:
+                    meta_record["tts_label"] = "ambiguous"
+            metadata[section].append(meta_record)
 
-            # --- Store metadata + hidden states ---
-            for anchor_idx, anchor in enumerate(anchor_steps):
-                section = anchor["section"]
-                global_step_idx = step_counters[section]
+            for layer in args.layers:
+                for approach in ("marker", "mean"):
+                    h = per_layer_hiddens[layer][approach][anchor_idx].float().numpy()
+                    hidden_states[section][approach][layer][global_step_idx] = h
 
-                tts_entry = tts_by_anchor.get(anchor_idx, {})
-                meta_record: Dict[str, Any] = {
-                    "step_global_idx": global_step_idx,
-                    "example_idx": example_idx,
-                    "section": section,
-                    "anchor_type": anchor["anchor_type"],
-                    "step_text": anchor["step_text"],
-                    "rel_pos": anchor["rel_pos"],
-                    "hidden_pos": anchor["hidden_pos"],
-                    "token_count": anchor["token_count"],
-                    "question": question,
-                    "ground_truth": ground_truth,
-                    "is_solvable": is_solvable,
-                }
-                if tts_entry:
-                    meta_record["tts"] = tts_entry["tts"]
-                    meta_record["ate1"] = tts_entry["ate1"]
-                    meta_record["ate0"] = tts_entry["ate0"]
-                    meta_record["p_no_perturb"] = tts_entry["p_no_perturb"]
-                    meta_record["p_perturb_s"] = tts_entry["p_perturb_s"]
-                    meta_record["p_perturb_c"] = tts_entry["p_perturb_c"]
-                    meta_record["p_perturb_sc"] = tts_entry["p_perturb_sc"]
-                    tts_val = tts_entry["tts"]
-                    if tts_val <= args.tts_threshold_low:
-                        meta_record["tts_label"] = "decorative"
-                    elif tts_val > args.tts_threshold_high:
-                        meta_record["tts_label"] = "true_thinking"
-                    else:
-                        meta_record["tts_label"] = "ambiguous"
-                metadata[section].append(meta_record)
+            step_counters[section] += 1
 
-                for layer in args.layers:
-                    for approach in ("marker", "mean"):
-                        h = per_layer_hiddens[layer][approach][anchor_idx].float().numpy()
-                        hidden_states[section][approach][layer][global_step_idx] = h
+        examples_processed += 1
 
-                step_counters[section] += 1
-
-            examples_processed += 1
-
-        # --- Periodic checkpoint (at batch boundary) ---
+    def _maybe_checkpoint() -> None:
         if examples_processed % args.save_every == 0 and examples_processed > 0:
             logger.info(
                 f"Checkpoint {examples_processed}/{len(ds)} | "
@@ -896,22 +945,107 @@ def main():
                    args.start_idx, end_idx, args.layers, args.save_float16,
                    args.tts_threshold_low, args.tts_threshold_high)
 
-    for local_idx, example in enumerate(tqdm(ds, desc="Processing")):
-        example_idx = args.start_idx + local_idx
-        question, ground_truth, is_solvable = _extract_fields(example)
-        prompt = build_cot_prompt(question)
-        if args.thinking_model and args.force_think_prefix:
-            prompt = prompt + "<think>\n"
+    # =========================================================================
+    # Path A — vLLM Pass 1, then HF Pass 2
+    # =========================================================================
+    if args.use_vllm:
+        all_data = _build_all_data()
 
-        batch_data.append((example_idx, question, ground_truth, is_solvable, prompt))
+        all_generated_ids = vllm_generate_all(
+            model_path=args.model_path,
+            prompts=[item[4] for item in all_data],
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            do_sample=args.do_sample,
+            top_p=args.top_p,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            dtype=args.dtype,
+        )
 
-        if len(batch_data) == args.generation_batch_size:
+        logger.info("Loading HF model for Pass 2...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=get_torch_dtype(args.dtype),
+            device_map="auto",
+            attn_implementation=args.attn_implementation,
+            local_files_only=True,
+        )
+        model.eval()
+
+        num_layers = getattr(model.config, "num_hidden_layers", None)
+        logger.info(f"Model has {num_layers} transformer layers. Extracting: {args.layers}")
+        if num_layers is not None:
+            bad = [l for l in args.layers if l < 0 or l > num_layers]
+            if bad:
+                raise ValueError(f"Invalid layer indices: {bad}  (valid: 0..{num_layers})")
+
+        for i, (example_idx, question, ground_truth, is_solvable, prompt) in enumerate(
+            tqdm(all_data, desc="Pass 2")
+        ):
+            _process_one(example_idx, question, ground_truth, is_solvable,
+                         prompt, all_generated_ids[i])
+            _maybe_checkpoint()
+
+    # =========================================================================
+    # Path B — HF batched Pass 1 + Pass 2
+    # =========================================================================
+    else:
+        logger.info("Loading HF model...")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=get_torch_dtype(args.dtype),
+            device_map="auto",
+            attn_implementation=args.attn_implementation,
+            local_files_only=True,
+        )
+        model.eval()
+
+        num_layers = getattr(model.config, "num_hidden_layers", None)
+        logger.info(f"Model has {num_layers} transformer layers. Extracting: {args.layers}")
+        if num_layers is not None:
+            bad = [l for l in args.layers if l < 0 or l > num_layers]
+            if bad:
+                raise ValueError(f"Invalid layer indices: {bad}  (valid: 0..{num_layers})")
+
+        def _process_batch(batch: List[Tuple]) -> None:
+            if not batch:
+                return
+            try:
+                all_gen_ids = batch_generate_pass1(
+                    model=model,
+                    tokenizer=tokenizer,
+                    prompt_texts=[item[4] for item in batch],
+                    max_input_length=args.max_input_length,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    do_sample=args.do_sample,
+                    top_p=args.top_p,
+                )
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    logger.warning(f"OOM during batch Pass 1 (size {len(batch)}), skipping")
+                    torch.cuda.empty_cache()
+                    return
+                raise
+            for i, (example_idx, question, ground_truth, is_solvable, prompt) in enumerate(batch):
+                _process_one(example_idx, question, ground_truth, is_solvable,
+                             prompt, all_gen_ids[i])
+            _maybe_checkpoint()
+
+        batch_data: List[Tuple] = []
+        for local_idx, example in enumerate(tqdm(ds, desc="Processing")):
+            example_idx = args.start_idx + local_idx
+            question, ground_truth, is_solvable = _extract_fields(example)
+            prompt = build_cot_prompt(question)
+            if args.thinking_model and args.force_think_prefix:
+                prompt += "<think>\n"
+            batch_data.append((example_idx, question, ground_truth, is_solvable, prompt))
+            if len(batch_data) == args.generation_batch_size:
+                _process_batch(batch_data)
+                batch_data = []
+        if batch_data:
             _process_batch(batch_data)
-            batch_data = []
-
-    # Flush any remaining partial batch
-    if batch_data:
-        _process_batch(batch_data)
 
     # --- Final save ---
     logger.info("=== Final save ===")
