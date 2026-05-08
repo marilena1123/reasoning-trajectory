@@ -149,10 +149,27 @@ def find_all_subseq(seq: List[int], subseq: List[int], stop_before: int = -1) ->
 
 
 def build_cot_prompt(question: str) -> str:
-    """Exact 'cot' prompt template from the reasoning-trajectory repo."""
+    """Exact 'cot' prompt template from the reasoning-trajectory repo.
+
+    Updated to prevent token repetition loops in final answer generation.
+    """
+    # Old version (kept for reference):
+    # return (
+    #     'You are a helpful assistant that solves problems step by step with each step signified by "Step [step_number]: ".\n'
+    #     "Always provide your final answer after #### at the end.\n"
+    #     "\n"
+    #     f"Question: {question}\n"
+    #     "\n"
+    #     'Please solve this step by step, putting each step after "Step [step_number]: " and always provide your final answer after ####.\n'
+    #     "\n"
+    #     "Solution:\n"
+    #     "\n"
+    # )
+
+    # Updated version: explicit termination to prevent answer repetition loops
     return (
         'You are a helpful assistant that solves problems step by step with each step signified by "Step [step_number]: ".\n'
-        "Always provide your final answer after #### at the end.\n"
+        "Always provide your final answer after #### at the end. Provide the final answer ONLY ONCE- DO NOT REPEAT IT. DO NOT WRITE ANYTHING AFTER STATING THE FINAL ANSWER. \n"
         "\n"
         f"Question: {question}\n"
         "\n"
